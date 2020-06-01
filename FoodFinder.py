@@ -34,8 +34,18 @@ LATENCY_MEASURE = measure.MeasureFloat(
 	"ms"
 )
 
-AGGREGATION_DISTRIBUTION = aggregation.DistributionAggregation(
+RPC_MEASURE = measure.MeasureInt(
+	"rpc_count",
+	"The number of RPCs",
+	"1"
+)
+
+FLOAT_AGGREGATION_DISTRIBUTION = aggregation.DistributionAggregation(
 	[1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0]
+)
+
+INT_AGGREGATION_DISTRIBUTION = aggregation.DistributionAggregation(
+	[1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000]
 )
 
 FOOD_SERVICE_LATENCY_VIEW = view.View(
@@ -43,7 +53,7 @@ FOOD_SERVICE_LATENCY_VIEW = view.View(
 	"The distribution of the request latencies for FoodService calls",
 	[],
 	LATENCY_MEASURE,
-	AGGREGATION_DISTRIBUTION
+	FLOAT_AGGREGATION_DISTRIBUTION
 )
 
 FOOD_VENDOR_LATENCY_VIEW = view.View(
@@ -51,7 +61,23 @@ FOOD_VENDOR_LATENCY_VIEW = view.View(
 	"The distribution of the request latencies for FoodVendor calls",
 	[],
 	LATENCY_MEASURE,
-	AGGREGATION_DISTRIBUTION
+	FLOAT_AGGREGATION_DISTRIBUTION
+)
+
+RPC_COUNT_VIEW = view.View(
+	"rpc_count_distribution",
+	"The distribution of rpcs made per FoodFinder request",
+	[],
+	RPC_MEASURE,
+	INT_AGGREGATION_DISTRIBUTION
+)
+
+RPC_ERROR_VIEW = view.View(
+	"rpc_error_diestribution",
+	"The distributione of rpc errors made per FoodFinder request",
+	[],
+	RPC_MEASURE,
+	INT_AGGREGATION_DISTRIBUTION
 )
 
 def initialize_tracer():
@@ -62,13 +88,23 @@ def initialize_tracer():
 	)
 	return tracer
 
+def register_views(view_manager):
+	view_manager.register_view(FOOD_SERVICE_LATENCY_VIEW)
+	view_manager.register_view(FOOD_VENDOR_LATENCY_VIEW)
+	view_manager.register_view(RPC_COUNT_VIEW)
+	view_manager.register_view(RPC_ERROR_VIEW)
+
 def make_vendor_request(vendor, food_item, response_list, index):
 	tracer = app.config['TRACER']
 	monitor = app.config['STATS']
 	
 	start = time.time()
 	tracer.span(name='FoodVendor')
-	response_list[index] = json.loads(requests.get(FOOD_VENDOR_ADDRESS, params = { 'vendor': vendor, 'item': food_item }).text)['data']
+	try:
+		response_list[index] = json.loads(requests.get(FOOD_VENDOR_ADDRESS, params = { 'vendor': vendor, 'item': food_item }).text)['data']
+	except:
+		app.config['ERRORS'] += 1
+	
 	tracer.end_span()
 	end = (time.time() - start) * 1000.0
 	monitor.measure_float_put(LATENCY_MEASURE, end)
@@ -94,6 +130,9 @@ def index():
 @app.route('/search-vendors', methods=['GET'])
 def search_vendors():
 	tracer = app.config['TRACER']
+	monitor = app.config['STATS']
+	app.config['ERRORS'] = 0
+	app.config['NUM_RPCS']
 
 	vendor_response = None
 
@@ -103,25 +142,47 @@ def search_vendors():
 
 		vendor_search_response = None
 		with tracer.span(name='FoodService') as food_service_span:
-			vendor_search_response = requests.get(FOOD_SUPPLIER_ADDRESS, params = { 'food_product': food_search_query })
-	
+			try:
+				vendor_search_response = requests.get(FOOD_SUPPLIER_ADDRESS, params = { 'food_product': food_search_query })
+			except:
+				app.config['ERRORS'] += 1
+			finally:
+				app.config['NUM_RPCS'] += 1
+
 		vendor_list = json.loads(vendor_search_response.text)['data']
 
 		food_finder_span.add_annotation(str(len(vendor_list)) + " vendors found with FoodService")
 
 		if len(vendor_list) == 0:
+			monitor.measure_int_put(RPC_MEASURE, app.config['NUM_RPCS'])
+			monitor.record()
+
+			if app.config['ERRORS'] > 0:
+				monitor.measure_input_put(RPC_MEASURE, app.config['ERRORS'])
+				monitor.record()
+
 			if vendor_search_response.status_code == 400:
 				return SUBMISSION_FORM + "<h1>No query submitted.</h1>"
 			return SUBMISSION_FORM + "<h1>" + food_search_query + " was not found in the list of food items.</h1>"
 	
 		response_list = process_vendor_list(vendor_list, food_search_query)
+		app.config['NUM_RPCS'] += len(vendor_list)
 
 		vendor_response = SUBMISSION_FORM + "<h1>Results for " + food_search_query + "</h1><table style=\"border-spacing: 1em .5em; padding: 0 2em 1em 0;\"><tr><th>Vendor</th><th>Count</th><th>Price (in USD)</th></tr>"
 		for index in range(len(response_list)):
-			vendor_response += "<tr><td>" + vendor_list[index] + "</td><td>" + str(response_list[index]['count']) + "</td><td>" + response_list[index]['price'] + "</tr>"
+			if (response_list[index] is not None):
+				vendor_response += "<tr><td>" + vendor_list[index] + "</td><td>" + str(response_list[index]['count']) + "</td><td>" + response_list[index]['price'] + "</tr>"
+			else:
+				vendor_response += "<tr><td>This vendor timed out.</td></tr>"
 
 		vendor_response += "</table>"
 
+	monitor.measure_int_put(RPC_MEASURE, app.config['NUM_RPCS'])
+	monitor.record()
+
+	if (app.config['ERRORS'] > 0):
+		monitor.measure_int_put(RPC_MEASURE, app.config['ERRORS'])
+		monitor.record()
 
 	return vendor_response
 
@@ -129,9 +190,11 @@ if __name__ == '__main__':
 	tracer = initialize_tracer()
 	app.config['TRACER'] = tracer
 	app.config['STATS'] = stats.stats.stats_recorder.new_measurement_map()
+	app.config['ERRORS'] = 0
+	app.config['NUM_RPCS'] = 0
 	
-	stats.stats.view_manager.register_view(FOOD_SERVICE_LATENCY_VIEW)
-	stats.stats.view_manager.register_view(FOOD_VENDOR_LATENCY_VIEW)
+	register_views(stats.stats.view_manager)
+	
 	exporter = stats_exporter.new_stats_exporter()
 	stats.stats.view_manager.register_exporter(exporter)
 
