@@ -21,7 +21,7 @@ MarkupSafe==1.1.1
 opencensus==0.7.7
 opencensus-context==0.1.1
 opencensus-ext-stackdriver==0.7.2
-protobuf==3.12.0
+protobuf==3.15.0
 pyasn1==0.4.8
 pyasn1-modules==0.2.8
 pytz==2020.1
